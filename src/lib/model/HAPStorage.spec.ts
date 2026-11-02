@@ -4,6 +4,9 @@ import path from "node:path";
 import { HAPFileStorage } from "./HAPFileStorage";
 import { HAPStorage } from "./HAPStorage";
 
+// Windows has no POSIX permission bits, so HAP-NodeJS leaves them alone there and there is nothing to assert
+const itWithPermissionBits = process.platform === "win32" ? it.skip : it;
+
 describe(HAPStorage, () => {
   let storagePath: string;
 
@@ -70,6 +73,53 @@ describe(HAPStorage, () => {
     });
   });
 
+  describe("owner-only persisted secrets", () => {
+    itWithPermissionBits("should create the persist directory readable by its owner only", () => {
+      const persistPath = path.join(storagePath, "persist");
+
+      const storage = new HAPStorage();
+      storage.setCustomStoragePath(persistPath);
+      storage.storage();
+
+      expect(fs.statSync(persistPath).mode & 0o777).toBe(0o700);
+    });
+
+    itWithPermissionBits("should restrict an existing persist directory, like one created by an earlier version", () => {
+      const persistPath = path.join(storagePath, "persist");
+      fs.mkdirSync(persistPath);
+      fs.chmodSync(persistPath, 0o755);
+
+      const storage = new HAPStorage();
+      storage.setCustomStoragePath(persistPath);
+      storage.storage();
+
+      expect(fs.statSync(persistPath).mode & 0o777).toBe(0o700);
+    });
+
+    itWithPermissionBits("should restrict the default 'persist' directory", () => {
+      const storage = new HAPStorage();
+
+      const previousCwd = process.cwd();
+      try {
+        process.chdir(storagePath);
+        storage.storage();
+
+        expect(fs.statSync(path.join(storagePath, "persist")).mode & 0o777).toBe(0o700);
+      } finally {
+        process.chdir(previousCwd);
+      }
+    });
+
+    itWithPermissionBits("should write files which are readable by their owner only", () => {
+      const storage = new HAPStorage();
+      storage.setCustomStoragePath(storagePath);
+
+      storage.storage().setItemSync("AccessoryInfo.CC223DE3CEF3.json", { pincode: "031-45-154" });
+
+      expect(fs.statSync(path.join(storagePath, "AccessoryInfo.CC223DE3CEF3.json")).mode & 0o777).toBe(0o600);
+    });
+  });
+
   describe("persist directory permissions (#1028)", () => {
     let warnSpy: jest.SpyInstance;
     let unwritableDir: string;
@@ -91,14 +141,33 @@ describe(HAPStorage, () => {
 
     it("warns when the persist directory is not writable", () => {
       fs.mkdirSync(unwritableDir, { recursive: true });
+
+      const storage = new HAPStorage();
+      storage.setCustomStoragePath(unwritableDir);
+      storage.storage();
+
+      // init restores owner access to a directory this user owns, so it is only unwritable for a directory owned by
+      // someone else (a container switched from root to a non-root user), which a test cannot create without root.
+      // making it unwritable after init and running the check again exercises the same path
+      fs.chmodSync(unwritableDir, 0o500); // read + execute, no write
+      warnSpy.mockClear();
+      // @ts-expect-error: private access
+      storage.checkStorageIsWritable();
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("is not writable"));
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(unwritableDir));
+    });
+
+    itWithPermissionBits("does not warn about a directory which init restored owner access to", () => {
+      fs.mkdirSync(unwritableDir, { recursive: true });
       fs.chmodSync(unwritableDir, 0o500); // read + execute, no write
 
       const storage = new HAPStorage();
       storage.setCustomStoragePath(unwritableDir);
       storage.storage();
 
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("is not writable"));
-      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(unwritableDir));
+      expect(warnSpy).not.toHaveBeenCalled();
+      expect(fs.statSync(unwritableDir).mode & 0o777).toBe(0o700);
     });
 
     it("does not warn when the persist directory is writable", () => {

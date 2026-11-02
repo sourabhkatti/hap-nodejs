@@ -1,6 +1,8 @@
+import createDebug from "debug";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { format } from "node:util";
 import { HAPFileStorage } from "./HAPFileStorage";
 
 function tempDir(): string {
@@ -21,6 +23,14 @@ function symlinksPermitted(): boolean {
 }
 
 const itWithSymlinks = symlinksPermitted() ? it : it.skip;
+
+// Windows has no POSIX permission bits, so HAP-NodeJS leaves them alone there and there is nothing to assert
+const itWithPermissionBits = process.platform === "win32" ? it.skip : it;
+const itWithPermissionBitsAndSymlinks = process.platform !== "win32" && symlinksPermitted() ? it : it.skip;
+
+function modeOf(file: string): number {
+  return fs.statSync(file).mode & 0o777;
+}
 
 describe(HAPFileStorage, () => {
   let dir: string;
@@ -330,6 +340,155 @@ describe(HAPFileStorage, () => {
 
       expect(() => inner.removeItemSync(`..${path.sep}victim.json`)).toThrow(/plain filename/);
       expect(fs.existsSync(path.join(dir, "victim.json"))).toBe(true);
+    });
+  });
+
+  describe("owner-only permissions", () => {
+    describe("initSync", () => {
+      itWithPermissionBits("should create a missing storage directory readable by its owner only", () => {
+        const nested = path.join(dir, "does", "not", "exist");
+        storage.initSync({ dir: nested });
+
+        expect(modeOf(nested)).toBe(0o700);
+      });
+
+      itWithPermissionBits("should restrict an existing storage directory which other users can read", () => {
+        fs.chmodSync(dir, 0o755);
+        storage.initSync({ dir: dir });
+
+        expect(modeOf(dir)).toBe(0o700);
+      });
+
+      itWithPermissionBits("should restrict existing files, like those written by an earlier version, without changing them", () => {
+        const file = path.join(dir, "AccessoryInfo.CC223DE3CEF3.json");
+        fs.writeFileSync(file, "{\"pincode\":\"031-45-154\"}");
+        fs.chmodSync(file, 0o644);
+
+        storage.initSync({ dir: dir });
+
+        expect(modeOf(file)).toBe(0o600);
+        expect(fs.readFileSync(file, "utf8")).toEqual("{\"pincode\":\"031-45-154\"}");
+        expect(storage.getItem("AccessoryInfo.CC223DE3CEF3.json")).toEqual({ pincode: "031-45-154" });
+      });
+
+      itWithPermissionBitsAndSymlinks("should not follow a symlink to restrict a file outside the storage directory", () => {
+        const outside = tempDir();
+        try {
+          const target = path.join(outside, "target.json");
+          fs.writeFileSync(target, "1");
+          fs.chmodSync(target, 0o644);
+          fs.symlinkSync(target, path.join(dir, "link.json"));
+
+          storage.initSync({ dir: dir });
+
+          expect(storage.getItem("link.json")).toEqual(1);
+          expect(modeOf(target)).toBe(0o644);
+        } finally {
+          fs.rmSync(outside, { recursive: true, force: true });
+        }
+      });
+
+      itWithPermissionBits("should leave permissions alone on Windows, which has no permission bits", () => {
+        const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+        const file = path.join(dir, "key.json");
+        fs.writeFileSync(file, "1");
+        fs.chmodSync(file, 0o644);
+        fs.chmodSync(dir, 0o755);
+
+        Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+        try {
+          storage.initSync({ dir: dir });
+        } finally {
+          Object.defineProperty(process, "platform", platform);
+        }
+
+        expect(modeOf(dir)).toBe(0o755);
+        expect(modeOf(file)).toBe(0o644);
+      });
+    });
+
+    describe("setItemSync", () => {
+      beforeEach(() => {
+        storage.initSync({ dir: dir });
+      });
+
+      itWithPermissionBits("should write files readable by their owner only", () => {
+        storage.setItemSync("AccessoryInfo.CC223DE3CEF3.json", { pincode: "031-45-154" });
+
+        expect(modeOf(path.join(dir, "AccessoryInfo.CC223DE3CEF3.json"))).toBe(0o600);
+      });
+
+      itWithPermissionBits("should restrict a file which became readable by others when it replaces it", () => {
+        storage.setItemSync("key.json", { a: 1 });
+        fs.chmodSync(path.join(dir, "key.json"), 0o644);
+
+        storage.setItemSync("key.json", { b: 2 });
+
+        expect(modeOf(path.join(dir, "key.json"))).toBe(0o600);
+        expect(fs.readFileSync(path.join(dir, "key.json"), "utf8")).toEqual("{\"b\":2}");
+      });
+
+      itWithPermissionBits("should restrict a storage directory which it had to recreate", () => {
+        fs.rmSync(dir, { recursive: true, force: true });
+
+        storage.setItemSync("key.json", { a: 1 });
+
+        expect(modeOf(dir)).toBe(0o700);
+        expect(modeOf(path.join(dir, "key.json"))).toBe(0o600);
+      });
+
+      itWithPermissionBits("should leave the permissions of an existing storage directory alone once initialized", () => {
+        // restricting happens when the storage is initialized: a directory an administrator opened up afterwards,
+        // for example to the group of a backup user, is not reverted by every write
+        fs.chmodSync(dir, 0o750);
+
+        storage.setItemSync("key.json", { a: 1 });
+
+        expect(modeOf(dir)).toBe(0o750);
+      });
+    });
+
+    describe("when restricting is rejected", () => {
+      let previousNamespaces: string;
+      let originalLog: typeof createDebug.log;
+      let messages: string[];
+
+      beforeEach(() => {
+        previousNamespaces = createDebug.disable();
+        originalLog = createDebug.log;
+        messages = [];
+
+        createDebug.enable("HAP-NodeJS:HAPFileStorage");
+        createDebug.log = (...args: unknown[]) => {
+          messages.push(format(...args));
+        };
+      });
+
+      afterEach(() => {
+        createDebug.log = originalLog;
+        createDebug.enable(previousNamespaces);
+      });
+
+      it("should log at debug level and carry on instead of failing", () => {
+        // chmod fails with ENOENT for a path which is gone, and with EPERM for one owned by another user,
+        // which a test cannot create without root
+        const gone = path.join(dir, "gone.json");
+
+        // @ts-expect-error: private access
+        expect(() => HAPFileStorage.restrictPermissions(gone, 0o600)).not.toThrow();
+
+        expect(messages).toHaveLength(1);
+        expect(messages[0]).toContain(gone);
+        expect(messages[0]).toContain("600");
+        expect(messages[0]).toContain("ENOENT");
+      });
+
+      itWithPermissionBits("should not log anything when restricting succeeds", () => {
+        storage.initSync({ dir: dir });
+        storage.setItemSync("key.json", { a: 1 });
+
+        expect(messages).toEqual([]);
+      });
     });
   });
 

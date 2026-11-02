@@ -1,5 +1,15 @@
+import createDebug from "debug";
 import fs from "node:fs";
 import path from "node:path";
+
+const debug = createDebug("HAP-NodeJS:HAPFileStorage");
+
+/**
+ * The persisted files hold the setup code, the accessory's signing key and the public keys of paired controllers,
+ * so they and the directory they live in are only accessible to the user running HAP-NodeJS.
+ */
+const DIRECTORY_MODE = 0o700;
+const FILE_MODE = 0o600;
 
 /**
  * Init options supported by {@link HAPFileStorage.initSync}.
@@ -48,6 +58,9 @@ const UNSUPPORTED_METHODS = [
  *
  * Writes are atomic, which node-persist's were not: see {@link setItemSync}.
  *
+ * The storage directory is restricted to its owner (`0700`) and so are the files in it (`0600`), which node-persist
+ * did not do. Windows has no equivalent permission bits, so nothing is changed there. See {@link initSync}.
+ *
  * @group Model
  */
 export class HAPFileStorage {
@@ -69,6 +82,13 @@ export class HAPFileStorage {
     }
   }
 
+  /**
+   * Loads the storage directory, creating it if it does not exist.
+   *
+   * The directory is restricted to its owner (`0700`) and so are the files already in it (`0600`).
+   * Failing to do so, like on a filesystem without permission bits or for files owned by another user,
+   * is logged at debug level and otherwise ignored, so that it can never keep an accessory from starting.
+   */
   initSync(options?: HAPFileStorageInitOptions): void {
     if (options) {
       const unsupportedOptions = Object.keys(options).filter(key => key !== "dir");
@@ -88,6 +108,9 @@ export class HAPFileStorage {
     }
 
     if (fs.existsSync(this.dir)) {
+      // a directory created by an earlier version is typically 0755, which lets every local user list and read it
+      HAPFileStorage.restrictPermissions(this.dir, DIRECTORY_MODE);
+
       for (const entry of fs.readdirSync(this.dir, { withFileTypes: true })) {
         if (entry.name.startsWith(".")) {
           continue;
@@ -101,10 +124,17 @@ export class HAPFileStorage {
           continue;
         }
 
+        // files written by an earlier version are typically 0644, and would stay that way until their next write.
+        // a symlink is left alone, as chmod follows it and would change a file outside the storage directory
+        if (entry.isFile()) {
+          HAPFileStorage.restrictPermissions(file, FILE_MODE);
+        }
+
         this.data.set(entry.name, HAPFileStorage.parse(fs.readFileSync(file, "utf8")));
       }
     } else {
       fs.mkdirSync(this.dir, { recursive: true });
+      HAPFileStorage.restrictPermissions(this.dir, DIRECTORY_MODE);
     }
   }
 
@@ -131,13 +161,19 @@ export class HAPFileStorage {
    *
    * The in-memory value is only replaced once the new one reached the disk, so a failed write cannot leave
    * an accessory which reads as paired now and unpaired after a restart.
+   *
+   * The temporary file is created owner-only (`0600`) and the rename carries that mode over to the target,
+   * so a file which was world-readable before is restricted by its next write.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/explicit-module-boundary-types
   setItemSync(key: string, value: any): void {
     HAPFileStorage.assertPlainKey(key);
 
-    // node-persist 0.0.12 ran mkdirp.sync before every write, which recreated a storage directory removed at runtime
-    fs.mkdirSync(this.dir, { recursive: true });
+    // node-persist 0.0.12 ran mkdirp.sync before every write, which recreated a storage directory removed at runtime.
+    // mkdirSync only returns a path when it created something, so an existing directory is not chmod'ed on every write
+    if (fs.mkdirSync(this.dir, { recursive: true }) !== undefined) {
+      HAPFileStorage.restrictPermissions(this.dir, DIRECTORY_MODE);
+    }
 
     const file = path.join(this.dir, key);
     // the dot prefix keeps a temporary file left behind by a crash from being loaded as a key by initSync,
@@ -146,7 +182,9 @@ export class HAPFileStorage {
     const temporaryFile = path.join(this.dir, `.${key}.${process.pid}.tmp`);
 
     try {
-      fs.writeFileSync(temporaryFile, JSON.stringify(value));
+      // the mode applies when the file is created, which the temporary file is unless a crashed process with the same
+      // pid left one behind. it is a no-op on Windows, and 0600 does not make the file read-only there
+      fs.writeFileSync(temporaryFile, JSON.stringify(value), { mode: FILE_MODE });
       fs.renameSync(temporaryFile, file);
     } catch (error) {
       try {
@@ -190,6 +228,26 @@ export class HAPFileStorage {
       throw new Error(`HAP-NodeJS's storage requires a key which is a plain filename, got ${JSON.stringify(key)}! ` +
         "One file is kept per key inside the storage directory, so a key can neither name a subdirectory, escape it, " +
         "nor start with a dot, which would be skipped the next time the directory is loaded.");
+    }
+  }
+
+  /**
+   * Restricts the given path to the given mode, without ever throwing.
+   *
+   * chmod is rejected on filesystems without permission bits (FAT, some network and container mounts) and for
+   * paths owned by another user, which is what happens when a container which ran as root is switched to a
+   * non-root user. Neither is a reason to refuse starting up, as the storage worked before it was restricted,
+   * so the failure is only logged. Windows has no permission bits to restrict, so nothing is attempted there.
+   */
+  private static restrictPermissions(target: string, mode: number): void {
+    if (process.platform === "win32") {
+      return;
+    }
+
+    try {
+      fs.chmodSync(target, mode);
+    } catch (error) {
+      debug("Could not restrict '%s' to mode %s: %s", target, mode.toString(8), (error as NodeJS.ErrnoException).code ?? error);
     }
   }
 

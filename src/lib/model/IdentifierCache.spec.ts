@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { IdentifierCache } from "./IdentifierCache";
 import { HAPStorage } from "./HAPStorage";
 
@@ -99,6 +101,21 @@ describe("IdentifierCache", () => {
 
       const saved = HAPStorage.storage().getItem(IdentifierCache.persistKey(identifierCache.username));
       expect(saved).toEqual({ cache: { foo: 1 } });
+    });
+
+    // Windows has no POSIX permission bits, so HAP-NodeJS leaves them alone there and there is nothing to assert
+    (process.platform === "win32" ? it.skip : it)("persists the cache readable by its owner only", () => {
+      const identifierCache = createIdentifierCache("owner-only");
+      identifierCache.setCache("foo", 1);
+
+      identifierCache.save();
+
+      const dir = (HAPStorage.storage() as unknown as { dir: string }).dir;
+      try {
+        expect(fs.statSync(path.join(dir, IdentifierCache.persistKey(identifierCache.username))).mode & 0o777).toBe(0o600);
+      } finally {
+        IdentifierCache.remove(identifierCache.username);
+      }
     });
   });
 

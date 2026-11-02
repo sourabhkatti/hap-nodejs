@@ -3,6 +3,8 @@ import { Categories } from "../Accessory";
 import { HAPStorage } from "./HAPStorage";
 import { AssertionError } from "assert";
 import createDebug from "debug";
+import fs from "node:fs";
+import path from "node:path";
 import { format } from "util";
 import { AccessoryJsonObject, CharacteristicJsonObject } from "../../types";
 import { Formats, Perms } from "../Characteristic";
@@ -24,6 +26,29 @@ describe("AccessoryInfo", () => {
       expect(info).not.toBeNull();
       expect(info!.category).toBe(Categories.OTHER);
       expect(typeof info!.category).toBe("number");
+    });
+  });
+
+  describe("#save()", () => {
+    // Windows has no POSIX permission bits, so HAP-NodeJS leaves them alone there and there is nothing to assert
+    const itWithPermissionBits = process.platform === "win32" ? it.skip : it;
+
+    itWithPermissionBits("should persist the setup code and signing key readable by their owner only", () => {
+      const username = "0E:AE:FC:45:7B:92";
+      const info = AccessoryInfo.create(username);
+      info.pincode = "031-45-154";
+
+      info.save();
+
+      const dir = (HAPStorage.storage() as unknown as { dir: string }).dir;
+      const file = path.join(dir, AccessoryInfo.persistKey(username));
+      try {
+        expect(fs.readFileSync(file, "utf8")).toContain(info.signSk.toString("hex"));
+        expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+      } finally {
+        AccessoryInfo.remove(username);
+      }
     });
   });
 
